@@ -5,7 +5,9 @@
 #include "ffnet/ffutil.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +17,8 @@
 
 int main(void)
 {
+    signal(SIGPIPE, SIG_IGN);
+
     int listen_fd = ffnet_tcp_create();
     if (listen_fd < 0) {
         fprintf(stderr, "FAIL: ffnet_tcp_create: %s\n",
@@ -92,5 +96,33 @@ int main(void)
         return 1;
     }
     printf("ok: child clean exit\n");
+
+    /* --- write-to-closed sub-test -------------------------------------
+     * Exercises that a real libc write() failing with EPIPE round-trips
+     * through ffutil_map_errno into FFE_PIPE without losing errno. */
+    {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+            perror("socketpair");
+            return 1;
+        }
+        close(sv[0]);                              /* peer end gone */
+        ssize_t w = write(sv[1], "x", 1);          /* expect EPIPE */
+        int saved_errno = errno;
+        close(sv[1]);
+        if (w != -1 || saved_errno != EPIPE) {
+            fprintf(stderr, "FAIL: write-to-closed: w=%zd errno=%d\n",
+                    w, saved_errno);
+            return 1;
+        }
+        int rc = ffutil_map_errno(-saved_errno);
+        if (rc != FFE_PIPE) {
+            fprintf(stderr, "FAIL: map_errno(EPIPE)=%d, want FFE_PIPE=%d\n",
+                    rc, FFE_PIPE);
+            return 1;
+        }
+        printf("ok: write-to-closed -> FFE_PIPE\n");
+    }
+
     return 0;
 }
