@@ -3,6 +3,7 @@
 #include "ffnet/ffproto.h"
 #include "ffnet/ffutil.h"
 #include "ffnet/byteorder.h"
+#include "utf8.h"     /* sibling file in src/libffproto/ws/ */
 
 #include <errno.h>
 #include <stddef.h>
@@ -15,7 +16,9 @@
  * Holds the opcode of the most-recent inbound data frame so write_frame
  * can echo with a matching type (text → text, binary → binary). */
 typedef struct WsConn {
-    uint8_t last_opcode;
+    uint8_t  last_opcode;       /* slice 1: echo opcode matching             */
+    uint8_t  fragment_opcode;   /* 0 / FFWS_OP_TEXT / FFWS_OP_BINARY         */
+    uint32_t utf8_state;        /* DFA state; reset at start of each text msg */
 } WsConn;
 
 /* ----- asm-side primitives (defined in ws_handshake.asm, ws_frame.asm) ---- */
@@ -72,10 +75,20 @@ static int read_one_frame(int fd, FfwsFrame *meta, FrameBuf *payload_out)
     int rc = read_n(fd, hdr, 2);
     if (rc != FFE_OK) return rc;
 
+    /* RSV1..3 must be zero unless an extension is negotiated. We don't
+     * negotiate any, so any RSV bit set is a protocol error. */
+    if (hdr[0] & 0x70) return FFE_PROTOCOL;
+
     meta->fin    = (hdr[0] & 0x80) ? 1 : 0;
     meta->opcode = hdr[0] & 0x0F;
     meta->masked = (hdr[1] & 0x80) ? 1 : 0;
     uint64_t plen = hdr[1] & 0x7F;
+
+    /* Control frames (opcode >= 0x8) must have FIN=1 and payload <= 125. */
+    if ((meta->opcode & 0x8) != 0) {
+        if (!meta->fin) return FFE_PROTOCOL;
+        if (plen > 125) return FFE_PROTOCOL;
+    }
 
     if (plen == 126) {
         uint8_t ext[2];
@@ -141,6 +154,28 @@ static int write_frame_raw(int fd, uint8_t opcode, const void *data, size_t n)
     return FFE_OK;
 }
 
+/* Send a Close frame with the given status code. Best-effort; on write
+ * failure return the rc so the caller can still propagate the original
+ * protocol error. The caller is expected to close the fd shortly after. */
+static int ws_close_with(int fd, uint16_t code)
+{
+    uint8_t body[2];
+    ff_be16_store(body, code);
+    return write_frame_raw(fd, FFWS_OP_CLOSE, body, 2);
+}
+
+/* Validate freshly-appended TEXT bytes against the WsConn's incremental
+ * UTF-8 state. Returns FFE_OK or FFE_PROTOCOL on reject. */
+static int validate_text_chunk(WsConn *c, const uint8_t *data, size_t n)
+{
+    if (!c) return FFE_OK;
+    for (size_t i = 0; i < n; i++) {
+        c->utf8_state = ff_utf8_decode(c->utf8_state, data[i]);
+        if (c->utf8_state == FF_UTF8_REJECT) return FFE_PROTOCOL;
+    }
+    return FFE_OK;
+}
+
 /* ---------------- Protocol entry points --------------------------------- */
 
 static int ws_server_handshake(int fd, void **ctx_out)
@@ -183,6 +218,8 @@ have_request:;
     WsConn *c = (WsConn *)calloc(1, sizeof(WsConn));
     if (!c) return FFE_NOMEM;
     c->last_opcode = FFWS_OP_TEXT;     /* default if write precedes any read */
+    /* fragment_opcode = 0 (no fragment in progress) and utf8_state = 0
+     * (== FF_UTF8_ACCEPT) come for free from calloc. */
     *ctx_out = c;
     return FFE_OK;
 }
@@ -191,14 +228,21 @@ static int ws_read_frame(int fd, void *ctx, FrameBuf *out)
 {
     WsConn *c = (WsConn *)ctx;
 
-    /* Loop until a data frame arrives. Control frames are handled inline. */
+    /* Loop until a complete data message has been assembled (FIN=1).
+     * Control frames are handled inline and do not advance the message-
+     * complete decision. Fragmented messages accumulate in `out` across
+     * iterations; UTF-8 is validated incrementally as bytes arrive. */
     for (;;) {
         FfwsFrame meta;
         size_t mark = out->len;
 
         int rc = read_one_frame(fd, &meta, out);
-        if (rc != FFE_OK) return rc;
+        if (rc != FFE_OK) {
+            if (rc == FFE_PROTOCOL) ws_close_with(fd, 1002);
+            return rc;
+        }
 
+        /* --- control frames (interleave freely; don't touch fragment state) */
         switch (meta.opcode) {
         case FFWS_OP_CLOSE:
             return FFE_CLOSED;
@@ -214,14 +258,66 @@ static int ws_read_frame(int fd, void *ctx, FrameBuf *out)
         case FFWS_OP_PONG:
             out->len = mark;
             continue;
+        }
 
+        /* --- data frames --- */
+        switch (meta.opcode) {
         case FFWS_OP_TEXT:
         case FFWS_OP_BINARY:
-            if (!meta.fin) return FFE_PROTOCOL;   /* slice 1: no fragments */
-            if (c) c->last_opcode = meta.opcode;
-            return FFE_OK;
+            /* A new data message begins; must not already be mid-fragment. */
+            if (c && c->fragment_opcode != 0) {
+                ws_close_with(fd, 1002);
+                return FFE_PROTOCOL;
+            }
+            /* For TEXT, reset the validator and check the new bytes. */
+            if (meta.opcode == FFWS_OP_TEXT) {
+                if (c) c->utf8_state = FF_UTF8_ACCEPT;
+                if (validate_text_chunk(c, out->data + mark,
+                                        out->len - mark) != FFE_OK) {
+                    ws_close_with(fd, 1007);
+                    return FFE_PROTOCOL;
+                }
+            }
+            if (meta.fin) {
+                if (meta.opcode == FFWS_OP_TEXT &&
+                    c && c->utf8_state != FF_UTF8_ACCEPT) {
+                    ws_close_with(fd, 1007);
+                    return FFE_PROTOCOL;
+                }
+                if (c) c->last_opcode = meta.opcode;
+                return FFE_OK;
+            }
+            /* Fragment start; remember opcode and read the next frame. */
+            if (c) c->fragment_opcode = meta.opcode;
+            continue;
+
+        case FFWS_OP_CONT:
+            if (!c || c->fragment_opcode == 0) {
+                ws_close_with(fd, 1002);
+                return FFE_PROTOCOL;
+            }
+            if (c->fragment_opcode == FFWS_OP_TEXT) {
+                if (validate_text_chunk(c, out->data + mark,
+                                        out->len - mark) != FFE_OK) {
+                    ws_close_with(fd, 1007);
+                    return FFE_PROTOCOL;
+                }
+            }
+            if (meta.fin) {
+                if (c->fragment_opcode == FFWS_OP_TEXT &&
+                    c->utf8_state != FF_UTF8_ACCEPT) {
+                    ws_close_with(fd, 1007);
+                    return FFE_PROTOCOL;
+                }
+                c->last_opcode = c->fragment_opcode;
+                c->fragment_opcode = 0;
+                return FFE_OK;
+            }
+            continue;
 
         default:
+            /* Reserved opcodes 0x3..0x7 and 0xB..0xF. */
+            ws_close_with(fd, 1002);
             return FFE_PROTOCOL;
         }
     }

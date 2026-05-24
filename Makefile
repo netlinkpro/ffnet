@@ -41,7 +41,8 @@ LIBFFPROTO_OBJ = \
     $(BUILD)/libffproto/registry.o          \
     $(BUILD)/libffproto/ws/ws_handshake.o   \
     $(BUILD)/libffproto/ws/ws_frame.o       \
-    $(BUILD)/libffproto/ws/ws_module.o
+    $(BUILD)/libffproto/ws/ws_module.o      \
+    $(BUILD)/libffproto/ws/utf8.o
 LIBFFPROTO = $(BUILD)/libffproto.a
 
 # ---- CLI ------------------------------------------------------------------
