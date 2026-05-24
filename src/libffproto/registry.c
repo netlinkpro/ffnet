@@ -5,9 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern const Protocol ffproto_http;
+
 /* Compiled-in protocols. Add new entries here when new modules ship. */
 static const Protocol *const g_static[] = {
     &ffproto_websocket,
+    &ffproto_http,
 };
 static const size_t g_static_count = sizeof(g_static) / sizeof(g_static[0]);
 

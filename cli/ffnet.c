@@ -14,6 +14,8 @@
 
 extern int cmd_ws_echo(int argc, char **argv);
 extern int cmd_tcp_echo(int argc, char **argv);
+extern int cmd_http_serve(int argc, char **argv);
+extern int cmd_http_echo(int argc, char **argv);
 
 typedef struct Subcommand {
     const char *name;
@@ -22,8 +24,10 @@ typedef struct Subcommand {
 } Subcommand;
 
 static const Subcommand g_cmds[] = {
-    { "ws-echo",  cmd_ws_echo,  "Run a WebSocket echo server" },
-    { "tcp-echo", cmd_tcp_echo, "Run a raw TCP echo server (event loop demo)" },
+    { "ws-echo",    cmd_ws_echo,    "Run a WebSocket echo server" },
+    { "tcp-echo",   cmd_tcp_echo,   "Run a raw TCP echo server (event loop demo)" },
+    { "http-serve", cmd_http_serve, "Run an HTTP/1.1 static file server" },
+    { "http-echo",  cmd_http_echo,  "Run an HTTP/1.1 echo server (POST body → response)" },
 };
 static const size_t g_cmds_count = sizeof(g_cmds) / sizeof(g_cmds[0]);
 

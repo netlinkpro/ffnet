@@ -40,18 +40,27 @@ LIBFFNET = $(BUILD)/libffnet.a
 
 # ---- libffproto -----------------------------------------------------------
 LIBFFPROTO_OBJ = \
-    $(BUILD)/libffproto/registry.o          \
-    $(BUILD)/libffproto/ws/ws_handshake.o   \
-    $(BUILD)/libffproto/ws/ws_frame.o       \
-    $(BUILD)/libffproto/ws/ws_module.o      \
-    $(BUILD)/libffproto/ws/utf8.o
+    $(BUILD)/libffproto/registry.o              \
+    $(BUILD)/libffproto/ws/ws_handshake.o       \
+    $(BUILD)/libffproto/ws/ws_frame.o           \
+    $(BUILD)/libffproto/ws/ws_module.o          \
+    $(BUILD)/libffproto/ws/utf8.o               \
+    $(BUILD)/libffproto/http/http_parse_asm.o   \
+    $(BUILD)/libffproto/http/http_parse.o       \
+    $(BUILD)/libffproto/http/http_mime.o        \
+    $(BUILD)/libffproto/http/http_resp.o        \
+    $(BUILD)/libffproto/http/http_module.o      \
+    $(BUILD)/libffproto/http/http_static.o      \
+    $(BUILD)/libffproto/http/http_echo.o
 LIBFFPROTO = $(BUILD)/libffproto.a
 
 # ---- CLI ------------------------------------------------------------------
 CLI_OBJ = \
-    $(BUILD)/cli/ffnet.o       \
-    $(BUILD)/cli/cmd_ws_echo.o \
-    $(BUILD)/cli/cmd_tcp_echo.o
+    $(BUILD)/cli/ffnet.o         \
+    $(BUILD)/cli/cmd_ws_echo.o   \
+    $(BUILD)/cli/cmd_tcp_echo.o  \
+    $(BUILD)/cli/cmd_http_serve.o \
+    $(BUILD)/cli/cmd_http_echo.o
 
 # Link order: late libs first (protocol → net → util).
 LIBS = $(LIBFFPROTO) $(LIBFFNET) $(LIBFFUTIL)
@@ -62,7 +71,8 @@ TEST_BINS = \
     $(BUILD)/tests/test_base64  \
     $(BUILD)/tests/test_tcp     \
     $(BUILD)/tests/test_ffutil  \
-    $(BUILD)/tests/test_evloop
+    $(BUILD)/tests/test_evloop  \
+    $(BUILD)/tests/test_http_parse
 
 # ===========================================================================
 # Default target
@@ -113,6 +123,14 @@ $(BUILD)/libffproto/%.o: src/libffproto/%.c
 $(BUILD)/libffproto/ws/%.o: src/libffproto/ws/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/libffproto/http/%.o: src/libffproto/http/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/libffproto/http/http_parse_asm.o: src/libffproto/http/http_parse.asm
+	@mkdir -p $(@D)
+	$(NASM) $(NASMFLAGS) -o $@ $<
 
 $(BUILD)/cli/%.o: cli/%.c
 	@mkdir -p $(@D)
