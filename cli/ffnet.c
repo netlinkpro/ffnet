@@ -1,4 +1,13 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
+//
+// Adding a new subcommand:
+//   1. Create cli/cmd_<name>.c with `int cmd_<name>(int argc, char **argv)`
+//      and a local `usage()` helper invoked on `--help` / `-h` / bad args.
+//   2. Add an `extern` declaration below.
+//   3. Add an entry to g_cmds[] with a one-line summary.
+//   4. Add the .o to CLI_OBJ in the Makefile.
+// Top-level `ffnet --help` auto-includes any new entry from g_cmds[].
+
 #include <stdio.h>
 #include <string.h>
 
@@ -17,11 +26,15 @@ static const size_t g_cmds_count = sizeof(g_cmds) / sizeof(g_cmds[0]);
 
 static void print_help(FILE *out)
 {
-    fprintf(out, "usage: ffnet <subcommand> [args...]\n\n");
-    fprintf(out, "Subcommands:\n");
+    fprintf(out, "ffnet — universal performant network library\n\n");
+    fprintf(out, "usage:\n");
+    fprintf(out, "  ffnet <subcommand> [args...]\n");
+    fprintf(out, "  ffnet --help\n\n");
+    fprintf(out, "subcommands:\n");
     for (size_t i = 0; i < g_cmds_count; i++) {
         fprintf(out, "  %-12s %s\n", g_cmds[i].name, g_cmds[i].summary);
     }
+    fprintf(out, "\nRun `ffnet <subcommand> --help` for subcommand-specific help.\n");
 }
 
 int main(int argc, char **argv)

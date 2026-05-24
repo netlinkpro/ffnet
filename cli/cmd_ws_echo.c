@@ -8,12 +8,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void usage(void)
+static void usage(FILE *out)
 {
-    fprintf(stderr, "usage: ffnet ws-echo --listen <addr>:<port>\n");
-    fprintf(stderr, "  <addr> is a dotted-quad IPv4 (e.g. 127.0.0.1 or 0.0.0.0).\n");
-    fprintf(stderr, "  Use port 0 for an ephemeral port; the actual port is\n");
-    fprintf(stderr, "  printed to stdout once the listener is bound.\n");
+    fprintf(out, "ffnet ws-echo — WebSocket echo server\n\n");
+    fprintf(out, "usage:\n");
+    fprintf(out, "  ffnet ws-echo --listen <addr>:<port>\n\n");
+    fprintf(out,
+        "Each text/binary frame received from a client is echoed back to that\n"
+        "client with the same opcode. Control frames (ping, close) are handled\n"
+        "inline per RFC 6455. Single-threaded, blocking I/O, one client at a time\n"
+        "in slice 1.\n\n");
+    fprintf(out, "arguments:\n");
+    fprintf(out,
+        "  --listen <addr>:<port>   IPv4 dotted-quad and TCP port. Use port 0 to\n"
+        "                           request an ephemeral port; the actual bound\n"
+        "                           port is printed on stdout when ready.\n\n");
+    fprintf(out, "example:\n");
+    fprintf(out, "  ffnet ws-echo --listen 127.0.0.1:8080\n");
 }
 
 /* Split "host:port" into a host string and a uint16_t port. */
@@ -77,15 +88,15 @@ int cmd_ws_echo(int argc, char **argv)
         if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
             listen_spec = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            usage();
+            usage(stdout);
             return 0;
         } else {
-            fprintf(stderr, "ws-echo: unknown arg: %s\n", argv[i]);
-            usage();
+            fprintf(stderr, "ws-echo: unknown arg: %s\n\n", argv[i]);
+            usage(stderr);
             return 2;
         }
     }
-    if (!listen_spec) { usage(); return 2; }
+    if (!listen_spec) { usage(stderr); return 2; }
 
     char     host[16];
     uint16_t port;
