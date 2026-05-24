@@ -14,7 +14,7 @@ AR       ?= ar
 PYTHON   ?= python3
 
 CFLAGS   ?= -O2 -g -Wall -Wextra -Wpedantic -std=c11 -fPIE -D_DEFAULT_SOURCE
-LDFLAGS  ?= -pie
+LDFLAGS  ?= -pie -lpthread
 # NB: do NOT use AS / ASFLAGS — make has builtin defaults (AS=as) that override `?=`.
 NASMFLAGS ?= -f elf64 -F dwarf -g -w+all
 
@@ -32,8 +32,10 @@ LIBFFUTIL = $(BUILD)/libffutil.a
 # ---- libffnet -------------------------------------------------------------
 # tcp.asm and tcp.c share a basename, so use distinct .o names.
 LIBFFNET_OBJ = \
-    $(BUILD)/libffnet/tcp_asm.o \
-    $(BUILD)/libffnet/tcp_c.o
+    $(BUILD)/libffnet/tcp_asm.o     \
+    $(BUILD)/libffnet/tcp_c.o       \
+    $(BUILD)/libffnet/eventloop.o   \
+    $(BUILD)/libffnet/server.o
 LIBFFNET = $(BUILD)/libffnet.a
 
 # ---- libffproto -----------------------------------------------------------
@@ -47,8 +49,9 @@ LIBFFPROTO = $(BUILD)/libffproto.a
 
 # ---- CLI ------------------------------------------------------------------
 CLI_OBJ = \
-    $(BUILD)/cli/ffnet.o \
-    $(BUILD)/cli/cmd_ws_echo.o
+    $(BUILD)/cli/ffnet.o       \
+    $(BUILD)/cli/cmd_ws_echo.o \
+    $(BUILD)/cli/cmd_tcp_echo.o
 
 # Link order: late libs first (protocol → net → util).
 LIBS = $(LIBFFPROTO) $(LIBFFNET) $(LIBFFUTIL)
@@ -58,7 +61,8 @@ TEST_BINS = \
     $(BUILD)/tests/test_sha1    \
     $(BUILD)/tests/test_base64  \
     $(BUILD)/tests/test_tcp     \
-    $(BUILD)/tests/test_ffutil
+    $(BUILD)/tests/test_ffutil  \
+    $(BUILD)/tests/test_evloop
 
 # ===========================================================================
 # Default target
@@ -93,6 +97,12 @@ $(BUILD)/libffutil/%.o: src/libffutil/%.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
 $(BUILD)/libffnet/tcp_c.o: src/libffnet/tcp.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+# Generic C compile for other libffnet .c files (eventloop.c, server.c).
+# Make prefers the explicit tcp_c.o / tcp_asm.o rules above for tcp.*.
+$(BUILD)/libffnet/%.o: src/libffnet/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 

@@ -2,8 +2,9 @@
 #include "ffnet/ffws.h"
 #include "ffnet/ffproto.h"
 #include "ffnet/ffutil.h"
+#include "ffnet/ffnet.h"
 #include "ffnet/byteorder.h"
-#include "utf8.h"     /* sibling file in src/libffproto/ws/ */
+#include "utf8.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -12,128 +13,61 @@
 #include <string.h>
 #include <unistd.h>                    /* read, write */
 
-/* Per-connection state, allocated in server_handshake, freed in close.
- * Holds the opcode of the most-recent inbound data frame so write_frame
- * can echo with a matching type (text → text, binary → binary). */
-typedef struct WsConn {
-    uint8_t  last_opcode;       /* slice 1: echo opcode matching             */
-    uint8_t  fragment_opcode;   /* 0 / FFWS_OP_TEXT / FFWS_OP_BINARY         */
-    uint32_t utf8_state;        /* DFA state; reset at start of each text msg */
-} WsConn;
-
 /* ----- asm-side primitives (defined in ws_handshake.asm, ws_frame.asm) ---- */
 extern int  _ff_asm_ws_find_key(const uint8_t *buf, uint64_t buflen,
                                 const uint8_t **out_key, uint64_t *out_keylen);
 extern int  _ff_asm_ws_accept_key(const uint8_t *key, uint64_t keylen,
                                   char out[29]);
-extern int  _ff_asm_ws_send_response(int fd, const char *accept_key,
-                                     uint64_t accept_len);
 extern void _ff_asm_ws_unmask(uint8_t *data, uint64_t len,
                               const uint8_t mask[4]);
 
-#define WS_HANDSHAKE_BUF 4096
+#define WS_HANDSHAKE_CAP   8192    /* refuse a request larger than this */
+#define WS_RD_CHUNK        4096    /* read this much per pass */
 
-/* ---------------- syscall loops ----------------------------------------- */
+typedef enum WsState {
+    WS_STATE_HANDSHAKE,
+    WS_STATE_OPEN,
+    WS_STATE_CLOSING,
+} WsState;
 
-static int read_n(int fd, void *buf, size_t n)
+typedef struct WsConn {
+    WsState   state;
+    FrameBuf  rd_buf;        /* inbound bytes not yet parsed */
+    FrameBuf  wr_buf;        /* outbound bytes not yet written */
+    size_t    wr_pos;        /* number of bytes already drained from wr_buf */
+    FrameBuf  msg_buf;       /* accumulates current data message across fragments */
+    uint8_t   fragment_opcode;   /* 0 / FFWS_OP_TEXT / FFWS_OP_BINARY */
+    uint32_t  utf8_state;
+    uint8_t   last_opcode;
+} WsConn;
+
+/* ---------------------------------------------------------------------------
+ * Outbound queue helpers — all queue bytes into wr_buf, never touch fd.
+ * --------------------------------------------------------------------------*/
+
+static int queue_handshake_response(WsConn *c, const char *accept_key,
+                                    size_t accept_len)
 {
-    uint8_t *p = (uint8_t *)buf;
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = read(fd, p + got, n - got);
-        if (r == 0) return FFE_CLOSED;
-        if (r <  0) {
-            if (errno == EINTR) continue;       /* retry on signal */
-            return ffutil_map_errno(-errno);
-        }
-        got += (size_t)r;
-    }
-    return FFE_OK;
+    static const char resp_a[] =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: ";
+    static const char resp_b[] = "\r\n\r\n";
+
+    int rc = framebuf_append(&c->wr_buf, resp_a, sizeof(resp_a) - 1);
+    if (rc != FFE_OK) return rc;
+    rc = framebuf_append(&c->wr_buf, accept_key, accept_len);
+    if (rc != FFE_OK) return rc;
+    return framebuf_append(&c->wr_buf, resp_b, sizeof(resp_b) - 1);
 }
 
-static int write_n(int fd, const void *buf, size_t n)
-{
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t sent = 0;
-    while (sent < n) {
-        ssize_t w = write(fd, p + sent, n - sent);
-        if (w <  0) {
-            if (errno == EINTR) continue;
-            return ffutil_map_errno(-errno);
-        }
-        if (w == 0) return FFE_IO;              /* shouldn't happen for blocking sockets */
-        sent += (size_t)w;
-    }
-    return FFE_OK;
-}
-
-/* ---------------- one-frame reader -------------------------------------- */
-
-static int read_one_frame(int fd, FfwsFrame *meta, FrameBuf *payload_out)
-{
-    uint8_t hdr[2];
-    int rc = read_n(fd, hdr, 2);
-    if (rc != FFE_OK) return rc;
-
-    /* RSV1..3 must be zero unless an extension is negotiated. We don't
-     * negotiate any, so any RSV bit set is a protocol error. */
-    if (hdr[0] & 0x70) return FFE_PROTOCOL;
-
-    meta->fin    = (hdr[0] & 0x80) ? 1 : 0;
-    meta->opcode = hdr[0] & 0x0F;
-    meta->masked = (hdr[1] & 0x80) ? 1 : 0;
-    uint64_t plen = hdr[1] & 0x7F;
-
-    /* Control frames (opcode >= 0x8) must have FIN=1 and payload <= 125. */
-    if ((meta->opcode & 0x8) != 0) {
-        if (!meta->fin) return FFE_PROTOCOL;
-        if (plen > 125) return FFE_PROTOCOL;
-    }
-
-    if (plen == 126) {
-        uint8_t ext[2];
-        rc = read_n(fd, ext, 2);
-        if (rc != FFE_OK) return rc;
-        plen = ff_be16_load(ext);
-    } else if (plen == 127) {
-        uint8_t ext[8];
-        rc = read_n(fd, ext, 8);
-        if (rc != FFE_OK) return rc;
-        plen = ff_be64_load(ext);
-    }
-    meta->payload_len = plen;
-
-    if (meta->masked) {
-        rc = read_n(fd, meta->mask, 4);
-        if (rc != FFE_OK) return rc;
-    } else {
-        memset(meta->mask, 0, 4);
-        /* RFC 6455 §5.1: client MUST mask. Reject unmasked client frames. */
-        if (plen > 0) return FFE_PROTOCOL;
-    }
-
-    if (plen == 0) return FFE_OK;
-
-    rc = framebuf_reserve(payload_out, (size_t)plen);
-    if (rc != FFE_OK) return rc;
-    rc = read_n(fd, payload_out->data + payload_out->len, (size_t)plen);
-    if (rc != FFE_OK) return rc;
-
-    if (meta->masked) {
-        _ff_asm_ws_unmask(payload_out->data + payload_out->len, plen, meta->mask);
-    }
-    payload_out->len += (size_t)plen;
-    return FFE_OK;
-}
-
-/* ---------------- frame writer (any opcode) ----------------------------- */
-
-static int write_frame_raw(int fd, uint8_t opcode, const void *data, size_t n)
+static int queue_frame(WsConn *c, uint8_t opcode, const void *data, size_t n)
 {
     uint8_t hdr[10];
     size_t  hlen;
 
-    hdr[0] = 0x80 | (opcode & 0x0F);              /* FIN=1, no RSV bits */
+    hdr[0] = 0x80 | (opcode & 0x0F);              /* FIN=1, no RSV */
 
     if (n < 126) {
         hdr[1] = (uint8_t)n;
@@ -148,24 +82,19 @@ static int write_frame_raw(int fd, uint8_t opcode, const void *data, size_t n)
         hlen = 10;
     }
 
-    int rc = write_n(fd, hdr, hlen);
+    int rc = framebuf_append(&c->wr_buf, hdr, hlen);
     if (rc != FFE_OK) return rc;
-    if (n > 0)        return write_n(fd, data, n);
+    if (n > 0) return framebuf_append(&c->wr_buf, data, n);
     return FFE_OK;
 }
 
-/* Send a Close frame with the given status code. Best-effort; on write
- * failure return the rc so the caller can still propagate the original
- * protocol error. The caller is expected to close the fd shortly after. */
-static int ws_close_with(int fd, uint16_t code)
+static int queue_close(WsConn *c, uint16_t code)
 {
     uint8_t body[2];
     ff_be16_store(body, code);
-    return write_frame_raw(fd, FFWS_OP_CLOSE, body, 2);
+    return queue_frame(c, FFWS_OP_CLOSE, body, 2);
 }
 
-/* Validate freshly-appended TEXT bytes against the WsConn's incremental
- * UTF-8 state. Returns FFE_OK or FFE_PROTOCOL on reject. */
 static int validate_text_chunk(WsConn *c, const uint8_t *data, size_t n)
 {
     if (!c) return FFE_OK;
@@ -176,196 +105,403 @@ static int validate_text_chunk(WsConn *c, const uint8_t *data, size_t n)
     return FFE_OK;
 }
 
-/* ---------------- Protocol entry points --------------------------------- */
+/* ---------------------------------------------------------------------------
+ * Frame parser — operates on rd_buf in place. Returns FFE_OK with consumed
+ * count, FFE_AGAIN (need more bytes), or FFE_PROTOCOL.
+ * --------------------------------------------------------------------------*/
 
-static int ws_server_handshake(int fd, void **ctx_out)
+typedef struct ParseResult {
+    int       rc;
+    FfwsFrame meta;
+    size_t    payload_off;   /* offset within buf of payload start */
+    size_t    total_len;     /* total bytes consumed (header + ext_len + mask + payload) */
+} ParseResult;
+
+static ParseResult try_parse_frame(const FrameBuf *buf)
 {
-    *ctx_out = NULL;
+    ParseResult r;
+    memset(&r, 0, sizeof r);
 
-    uint8_t buf[WS_HANDSHAKE_BUF];
-    size_t  used = 0;
+    if (buf->len < 2) { r.rc = FFE_AGAIN; return r; }
+    const uint8_t *p = buf->data;
 
-    while (used < sizeof(buf)) {
-        ssize_t r = read(fd, buf + used, sizeof(buf) - used);
-        if (r == 0) return FFE_CLOSED;
-        if (r <  0) return FFE_IO;
-        used += (size_t)r;
+    if (p[0] & 0x70) { r.rc = FFE_PROTOCOL; return r; }   /* RSV bits */
 
-        if (used >= 4) {
-            for (size_t i = 0; i + 4 <= used; i++) {
-                if (buf[i]   == '\r' && buf[i + 1] == '\n' &&
-                    buf[i + 2] == '\r' && buf[i + 3] == '\n') {
-                    goto have_request;
+    r.meta.fin    = (p[0] & 0x80) ? 1 : 0;
+    r.meta.opcode = p[0] & 0x0F;
+    r.meta.masked = (p[1] & 0x80) ? 1 : 0;
+    uint64_t plen = p[1] & 0x7F;
+    size_t off = 2;
+
+    if (plen == 126) {
+        if (buf->len < off + 2) { r.rc = FFE_AGAIN; return r; }
+        plen = ff_be16_load(p + off);
+        off += 2;
+    } else if (plen == 127) {
+        if (buf->len < off + 8) { r.rc = FFE_AGAIN; return r; }
+        plen = ff_be64_load(p + off);
+        off += 8;
+    }
+
+    /* Control frames must have FIN=1 and payload ≤ 125. */
+    if ((r.meta.opcode & 0x8) != 0) {
+        if (!r.meta.fin) { r.rc = FFE_PROTOCOL; return r; }
+        if (plen > 125) { r.rc = FFE_PROTOCOL; return r; }
+    }
+    r.meta.payload_len = plen;
+
+    if (r.meta.masked) {
+        if (buf->len < off + 4) { r.rc = FFE_AGAIN; return r; }
+        memcpy(r.meta.mask, p + off, 4);
+        off += 4;
+    } else {
+        memset(r.meta.mask, 0, 4);
+        if (plen > 0) { r.rc = FFE_PROTOCOL; return r; }   /* RFC: client MUST mask */
+    }
+
+    if (buf->len < off + plen) { r.rc = FFE_AGAIN; return r; }
+
+    r.payload_off = off;
+    r.total_len   = off + (size_t)plen;
+    r.rc = FFE_OK;
+    return r;
+}
+
+/* ---------------------------------------------------------------------------
+ * dispatch_frame — process a complete parsed frame (payload already unmasked
+ * in caller). Echoes data messages, handles control frames, manages
+ * fragmentation + UTF-8 state. Queues Close into wr_buf on protocol error.
+ * Returns FFE_OK to continue, or FFE_PROTOCOL on error (state transitions to
+ * CLOSING in caller).
+ * --------------------------------------------------------------------------*/
+
+static int dispatch_frame(WsConn *c, const FfwsFrame *meta, const uint8_t *payload)
+{
+    int rc;
+
+    switch (meta->opcode) {
+    case FFWS_OP_CLOSE: {
+        /* RFC 6455 §5.5.1, §7.4: validate peer's close payload before echoing. */
+        uint16_t code = 1000;
+
+        if (meta->payload_len == 1) {
+            /* 1-byte payload is malformed (must be 0 or >=2). */
+            queue_close(c, 1002);
+            c->state = WS_STATE_CLOSING;
+            return FFE_PROTOCOL;
+        }
+        if (meta->payload_len >= 2) {
+            code = ff_be16_load(payload);
+            /* Valid status codes: 1000, 1001, 1002, 1003, 1007–1011, 3000–4999.
+             * Reserved-not-to-use (1004, 1005, 1006, 1015), below-range (<1000),
+             * gaps (1012–1014, 1016+ before 3000), and extension-reserved
+             * (2000–2999) all → protocol error. */
+            int valid =
+                code == 1000 || code == 1001 || code == 1002 || code == 1003 ||
+                (code >= 1007 && code <= 1011) ||
+                (code >= 3000 && code <= 4999);
+            if (!valid) {
+                queue_close(c, 1002);
+                c->state = WS_STATE_CLOSING;
+                return FFE_PROTOCOL;
+            }
+            /* Reason text (bytes 2..) must be valid UTF-8. */
+            if (meta->payload_len > 2) {
+                uint32_t st = FF_UTF8_ACCEPT;
+                for (size_t i = 2; i < (size_t)meta->payload_len; i++) {
+                    st = ff_utf8_decode(st, payload[i]);
+                    if (st == FF_UTF8_REJECT) break;
+                }
+                if (st != FF_UTF8_ACCEPT) {
+                    queue_close(c, 1007);
+                    c->state = WS_STATE_CLOSING;
+                    return FFE_PROTOCOL;
                 }
             }
         }
+        /* Echo peer's code (or 1000 if no payload). */
+        if (queue_close(c, code) != FFE_OK) return FFE_NOMEM;
+        c->state = WS_STATE_CLOSING;
+        return FFE_OK;
     }
-    return FFE_PROTOCOL;       /* request larger than handshake buffer */
 
-have_request:;
+    case FFWS_OP_PING:
+        return queue_frame(c, FFWS_OP_PONG, payload, (size_t)meta->payload_len);
+
+    case FFWS_OP_PONG:
+        return FFE_OK;   /* unsolicited pong: ignore */
+
+    case FFWS_OP_TEXT:
+    case FFWS_OP_BINARY:
+        if (c->fragment_opcode != 0) {
+            queue_close(c, 1002);
+            return FFE_PROTOCOL;
+        }
+        if (meta->opcode == FFWS_OP_TEXT) {
+            c->utf8_state = FF_UTF8_ACCEPT;
+            if (validate_text_chunk(c, payload, (size_t)meta->payload_len) != FFE_OK) {
+                queue_close(c, 1007);
+                return FFE_PROTOCOL;
+            }
+        }
+        rc = framebuf_append(&c->msg_buf, payload, (size_t)meta->payload_len);
+        if (rc != FFE_OK) return rc;
+        if (meta->fin) {
+            if (meta->opcode == FFWS_OP_TEXT && c->utf8_state != FF_UTF8_ACCEPT) {
+                queue_close(c, 1007);
+                return FFE_PROTOCOL;
+            }
+            rc = queue_frame(c, meta->opcode, c->msg_buf.data, c->msg_buf.len);
+            framebuf_reset(&c->msg_buf);
+            c->last_opcode = meta->opcode;
+            return rc;
+        }
+        c->fragment_opcode = meta->opcode;
+        return FFE_OK;
+
+    case FFWS_OP_CONT:
+        if (c->fragment_opcode == 0) {
+            queue_close(c, 1002);
+            return FFE_PROTOCOL;
+        }
+        if (c->fragment_opcode == FFWS_OP_TEXT) {
+            if (validate_text_chunk(c, payload, (size_t)meta->payload_len) != FFE_OK) {
+                queue_close(c, 1007);
+                return FFE_PROTOCOL;
+            }
+        }
+        rc = framebuf_append(&c->msg_buf, payload, (size_t)meta->payload_len);
+        if (rc != FFE_OK) return rc;
+        if (meta->fin) {
+            if (c->fragment_opcode == FFWS_OP_TEXT && c->utf8_state != FF_UTF8_ACCEPT) {
+                queue_close(c, 1007);
+                return FFE_PROTOCOL;
+            }
+            rc = queue_frame(c, c->fragment_opcode, c->msg_buf.data, c->msg_buf.len);
+            framebuf_reset(&c->msg_buf);
+            c->last_opcode = c->fragment_opcode;
+            c->fragment_opcode = 0;
+            return rc;
+        }
+        return FFE_OK;
+
+    default:
+        /* Reserved opcodes 0x3..0x7 and 0xB..0xF. */
+        queue_close(c, 1002);
+        return FFE_PROTOCOL;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Handshake processor — scans rd_buf for end-of-headers, runs find_key +
+ * accept_key, queues 101 response, transitions to OPEN. Returns FFE_OK
+ * (transitioned or waiting for more bytes) or negative on protocol error.
+ * --------------------------------------------------------------------------*/
+
+static int process_handshake(WsConn *c)
+{
+    /* Look for \r\n\r\n. */
+    if (c->rd_buf.len < 4) return FFE_OK;          /* keep reading */
+
+    size_t end = 0;
+    int found = 0;
+    for (size_t i = 0; i + 4 <= c->rd_buf.len; i++) {
+        if (c->rd_buf.data[i]     == '\r' && c->rd_buf.data[i + 1] == '\n' &&
+            c->rd_buf.data[i + 2] == '\r' && c->rd_buf.data[i + 3] == '\n') {
+            end = i + 4;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        if (c->rd_buf.len > WS_HANDSHAKE_CAP) return FFE_PROTOCOL;
+        return FFE_OK;
+    }
+
     const uint8_t *key;
     uint64_t keylen;
-    int rc = _ff_asm_ws_find_key(buf, used, &key, &keylen);
-    if (rc != 0) return FFE_BADKEY;
+    if (_ff_asm_ws_find_key(c->rd_buf.data, end, &key, &keylen) != 0) {
+        return FFE_BADKEY;
+    }
 
     char accept[29];
-    rc = _ff_asm_ws_accept_key(key, keylen, accept);
-    if (rc != 0) return FFE_BADKEY;
+    if (_ff_asm_ws_accept_key(key, keylen, accept) != 0) return FFE_BADKEY;
 
-    rc = _ff_asm_ws_send_response(fd, accept, 28);
-    if (rc < 0) return FFE_IO;
+    int rc = queue_handshake_response(c, accept, 28);
+    if (rc != FFE_OK) return rc;
 
+    /* Consume the handshake bytes from rd_buf. */
+    memmove(c->rd_buf.data, c->rd_buf.data + end, c->rd_buf.len - end);
+    c->rd_buf.len -= end;
+
+    c->state = WS_STATE_OPEN;
+    return FFE_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Frame processor — runs the parser repeatedly on rd_buf until it returns
+ * AGAIN or PROTOCOL. Per-frame work goes through dispatch_frame.
+ * --------------------------------------------------------------------------*/
+
+static int process_frames(WsConn *c)
+{
+    for (;;) {
+        ParseResult r = try_parse_frame(&c->rd_buf);
+        if (r.rc == FFE_AGAIN) return FFE_OK;
+        if (r.rc != FFE_OK) {
+            queue_close(c, 1002);
+            c->state = WS_STATE_CLOSING;
+            return FFE_OK;
+        }
+
+        if (r.meta.masked && r.meta.payload_len > 0) {
+            _ff_asm_ws_unmask(c->rd_buf.data + r.payload_off,
+                              r.meta.payload_len, r.meta.mask);
+        }
+
+        int rc = dispatch_frame(c, &r.meta,
+                                c->rd_buf.data + r.payload_off);
+
+        /* Consume the frame from rd_buf. */
+        memmove(c->rd_buf.data, c->rd_buf.data + r.total_len,
+                c->rd_buf.len - r.total_len);
+        c->rd_buf.len -= r.total_len;
+
+        if (rc != FFE_OK) {
+            c->state = WS_STATE_CLOSING;
+            return FFE_OK;
+        }
+        if (c->state != WS_STATE_OPEN) return FFE_OK;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * I/O drain helpers.
+ * --------------------------------------------------------------------------*/
+
+/* Read as much as possible into rd_buf. Returns FFE_OK (got some, EAGAIN
+ * reached), FFE_CLOSED (peer EOF), or negative on error. */
+static int drain_read(WsConn *c, int fd)
+{
+    for (;;) {
+        int rc = framebuf_reserve(&c->rd_buf, WS_RD_CHUNK);
+        if (rc != FFE_OK) return rc;
+        ssize_t n = read(fd, c->rd_buf.data + c->rd_buf.len,
+                         c->rd_buf.cap - c->rd_buf.len);
+        if (n == 0) return FFE_CLOSED;
+        if (n  < 0) {
+            if (errno == EINTR)        continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return FFE_OK;
+            return ffutil_map_errno(-errno);
+        }
+        c->rd_buf.len += (size_t)n;
+    }
+}
+
+/* Write as much as possible from wr_buf. Returns FFE_OK or negative. */
+static int drain_write(WsConn *c, int fd)
+{
+    while (c->wr_pos < c->wr_buf.len) {
+        ssize_t n = write(fd, c->wr_buf.data + c->wr_pos,
+                          c->wr_buf.len - c->wr_pos);
+        if (n < 0) {
+            if (errno == EINTR)        continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return FFE_OK;
+            return ffutil_map_errno(-errno);
+        }
+        c->wr_pos += (size_t)n;
+    }
+    /* All drained: compact. */
+    if (c->wr_pos > 0) {
+        c->wr_buf.len = 0;
+        c->wr_pos = 0;
+    }
+    return FFE_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Protocol entry points (ABI v3).
+ * --------------------------------------------------------------------------*/
+
+static int ws_open(int fd, void **ctx_out)
+{
+    (void)fd;
     WsConn *c = (WsConn *)calloc(1, sizeof(WsConn));
     if (!c) return FFE_NOMEM;
-    c->last_opcode = FFWS_OP_TEXT;     /* default if write precedes any read */
-    /* fragment_opcode = 0 (no fragment in progress) and utf8_state = 0
-     * (== FF_UTF8_ACCEPT) come for free from calloc. */
+    c->state = WS_STATE_HANDSHAKE;
+    c->last_opcode = FFWS_OP_TEXT;
+    /* utf8_state == FF_UTF8_ACCEPT (== 0) from calloc.
+     * fragment_opcode == 0 (no fragment in progress) from calloc. */
     *ctx_out = c;
     return FFE_OK;
 }
 
-static int ws_read_frame(int fd, void *ctx, FrameBuf *out)
+static int ws_on_event(int fd, void *ctx, uint32_t events)
 {
     WsConn *c = (WsConn *)ctx;
+    int rc;
 
-    /* Loop until a complete data message has been assembled (FIN=1).
-     * Control frames are handled inline and do not advance the message-
-     * complete decision. Fragmented messages accumulate in `out` across
-     * iterations; UTF-8 is validated incrementally as bytes arrive. */
-    for (;;) {
-        FfwsFrame meta;
-        size_t mark = out->len;
-
-        int rc = read_one_frame(fd, &meta, out);
-        if (rc != FFE_OK) {
-            if (rc == FFE_PROTOCOL) ws_close_with(fd, 1002);
+    if (events & FF_EV_READ) {
+        rc = drain_read(c, fd);
+        if (rc == FFE_CLOSED) {
+            /* Peer EOF. If we still have bytes to write, drain them then close;
+             * otherwise close immediately. */
+            if (c->wr_buf.len > c->wr_pos) {
+                c->state = WS_STATE_CLOSING;
+            } else {
+                return 0;
+            }
+        } else if (rc != FFE_OK) {
             return rc;
         }
 
-        /* --- control frames (interleave freely; don't touch fragment state) */
-        switch (meta.opcode) {
-        case FFWS_OP_CLOSE:
-            return FFE_CLOSED;
-
-        case FFWS_OP_PING: {
-            int wrc = write_frame_raw(fd, FFWS_OP_PONG,
-                                      out->data + mark, out->len - mark);
-            out->len = mark;
-            if (wrc != FFE_OK) return wrc;
-            continue;
+        if (c->state == WS_STATE_HANDSHAKE) {
+            rc = process_handshake(c);
+            if (rc != FFE_OK) {
+                /* Protocol error during handshake: just close (peer is HTTP,
+                 * not a WS client yet — no point sending Close frame). */
+                return 0;
+            }
         }
-
-        case FFWS_OP_PONG:
-            out->len = mark;
-            continue;
-        }
-
-        /* --- data frames --- */
-        switch (meta.opcode) {
-        case FFWS_OP_TEXT:
-        case FFWS_OP_BINARY:
-            /* A new data message begins; must not already be mid-fragment. */
-            if (c && c->fragment_opcode != 0) {
-                ws_close_with(fd, 1002);
-                return FFE_PROTOCOL;
-            }
-            /* For TEXT, reset the validator and check the new bytes. */
-            if (meta.opcode == FFWS_OP_TEXT) {
-                if (c) c->utf8_state = FF_UTF8_ACCEPT;
-                if (validate_text_chunk(c, out->data + mark,
-                                        out->len - mark) != FFE_OK) {
-                    ws_close_with(fd, 1007);
-                    return FFE_PROTOCOL;
-                }
-            }
-            if (meta.fin) {
-                if (meta.opcode == FFWS_OP_TEXT &&
-                    c && c->utf8_state != FF_UTF8_ACCEPT) {
-                    ws_close_with(fd, 1007);
-                    return FFE_PROTOCOL;
-                }
-                if (c) c->last_opcode = meta.opcode;
-                return FFE_OK;
-            }
-            /* Fragment start; remember opcode and read the next frame. */
-            if (c) c->fragment_opcode = meta.opcode;
-            continue;
-
-        case FFWS_OP_CONT:
-            if (!c || c->fragment_opcode == 0) {
-                ws_close_with(fd, 1002);
-                return FFE_PROTOCOL;
-            }
-            if (c->fragment_opcode == FFWS_OP_TEXT) {
-                if (validate_text_chunk(c, out->data + mark,
-                                        out->len - mark) != FFE_OK) {
-                    ws_close_with(fd, 1007);
-                    return FFE_PROTOCOL;
-                }
-            }
-            if (meta.fin) {
-                if (c->fragment_opcode == FFWS_OP_TEXT &&
-                    c->utf8_state != FF_UTF8_ACCEPT) {
-                    ws_close_with(fd, 1007);
-                    return FFE_PROTOCOL;
-                }
-                c->last_opcode = c->fragment_opcode;
-                c->fragment_opcode = 0;
-                return FFE_OK;
-            }
-            continue;
-
-        default:
-            /* Reserved opcodes 0x3..0x7 and 0xB..0xF. */
-            ws_close_with(fd, 1002);
-            return FFE_PROTOCOL;
+        if (c->state == WS_STATE_OPEN) {
+            rc = process_frames(c);
+            if (rc != FFE_OK) return rc;
         }
     }
-}
 
-static int ws_write_frame(int fd, void *ctx, const FrameBuf *in)
-{
-    WsConn *c = (WsConn *)ctx;
-    uint8_t opcode = (c && c->last_opcode) ? c->last_opcode : FFWS_OP_TEXT;
-    return write_frame_raw(fd, opcode, in->data, in->len);
+    if (c->wr_buf.len > c->wr_pos) {
+        rc = drain_write(c, fd);
+        if (rc != FFE_OK) return rc;
+    }
+
+    /* If closing and drained, we're done. */
+    if (c->state == WS_STATE_CLOSING && c->wr_buf.len == c->wr_pos) {
+        return 0;
+    }
+
+    /* Compute next event mask. */
+    uint32_t want = 0;
+    if (c->state != WS_STATE_CLOSING) want |= FF_EV_READ;
+    if (c->wr_buf.len > c->wr_pos)    want |= FF_EV_WRITE;
+    if (want == 0) return 0;          /* nothing to wait for: close */
+    return (int)want;
 }
 
 static int ws_close(int fd, void *ctx)
 {
     (void)fd;
-    free(ctx);
+    WsConn *c = (WsConn *)ctx;
+    if (!c) return FFE_OK;
+    framebuf_free(&c->rd_buf);
+    framebuf_free(&c->wr_buf);
+    framebuf_free(&c->msg_buf);
+    free(c);
     return FFE_OK;
 }
 
 const Protocol ffproto_websocket = {
-    .name             = "websocket",
-    .server_handshake = ws_server_handshake,
-    .read_frame       = ws_read_frame,
-    .write_frame      = ws_write_frame,
-    .close            = ws_close,
+    .name     = "websocket",
+    .open     = ws_open,
+    .on_event = ws_on_event,
+    .close    = ws_close,
 };
-
-/* ---------------- public ffws_send_* helpers ---------------------------- */
-
-int ffws_send_text(int fd, const void *data, size_t n)
-{
-    return write_frame_raw(fd, FFWS_OP_TEXT, data, n);
-}
-
-int ffws_send_binary(int fd, const void *data, size_t n)
-{
-    return write_frame_raw(fd, FFWS_OP_BINARY, data, n);
-}
-
-int ffws_send_close(int fd, uint16_t status)
-{
-    if (status == 0) return write_frame_raw(fd, FFWS_OP_CLOSE, NULL, 0);
-    uint8_t body[2];
-    ff_be16_store(body, status);
-    return write_frame_raw(fd, FFWS_OP_CLOSE, body, 2);
-}
-
-int ffws_send_pong(int fd, const void *data, size_t n)
-{
-    return write_frame_raw(fd, FFWS_OP_PONG, data, n);
-}

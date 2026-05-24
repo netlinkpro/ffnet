@@ -24,12 +24,10 @@ default rel
 
 global _ff_asm_ws_find_key
 global _ff_asm_ws_accept_key
-global _ff_asm_ws_send_response
 
 extern ff_sha1
 extern ff_base64_encode
 
-%define SYS_write    1
 %define FFE_BADKEY  -3
 
 section .rodata
@@ -41,18 +39,6 @@ ws_key_header_len equ $ - ws_key_header                 ; 18
 ws_magic_guid:
     db "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 ws_magic_guid_len equ $ - ws_magic_guid                 ; 36
-
-; Response template, split around the place where the accept key is spliced in.
-ws_resp_a:
-    db "HTTP/1.1 101 Switching Protocols", 13, 10
-    db "Upgrade: websocket", 13, 10
-    db "Connection: Upgrade", 13, 10
-    db "Sec-WebSocket-Accept: "
-ws_resp_a_len equ $ - ws_resp_a                         ; 97
-
-ws_resp_b:
-    db 13, 10, 13, 10
-ws_resp_b_len equ $ - ws_resp_b                         ; 4
 
 section .text
 
@@ -191,63 +177,6 @@ _ff_asm_ws_accept_key:
     mov     eax, FFE_BADKEY
 .ret:
     add     rsp, 152
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    ret
-
-; -----------------------------------------------------------------------------
-; _ff_asm_ws_send_response
-;     rdi = fd
-;     rsi = accept_key
-;     rdx = accept_len
-;
-; Writes:  ws_resp_a + accept_key + ws_resp_b   (single sys_write)
-_ff_asm_ws_send_response:
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    sub     rsp, 200                ; response staging buffer
-
-    mov     r12d, edi               ; fd
-    mov     r13, rsi                ; accept_key ptr
-    mov     r14, rdx                ; accept_len
-
-    ; Copy ws_resp_a to [rsp + 0]
-    mov     rdi, rsp
-    lea     rsi, [rel ws_resp_a]
-    mov     rcx, ws_resp_a_len
-    rep movsb
-
-    ; Append accept_key
-    mov     rsi, r13
-    mov     rcx, r14
-    rep movsb
-
-    ; Append ws_resp_b
-    lea     rsi, [rel ws_resp_b]
-    mov     rcx, ws_resp_b_len
-    rep movsb
-
-    ; total = ws_resp_a_len + accept_len + ws_resp_b_len
-    mov     rbx, ws_resp_a_len
-    add     rbx, r14
-    add     rbx, ws_resp_b_len
-
-    ; sys_write(fd, rsp, rbx)
-    mov     edi, r12d
-    mov     rsi, rsp
-    mov     rdx, rbx
-    mov     eax, SYS_write
-    syscall
-    test    rax, rax
-    js      .ret                    ; rax = -errno
-
-    xor     eax, eax                ; success → 0
-.ret:
-    add     rsp, 200
     pop     r14
     pop     r13
     pop     r12

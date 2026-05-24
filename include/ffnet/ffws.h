@@ -26,17 +26,12 @@ typedef struct FfwsFrame {
     uint8_t  mask[4];       /* zero when masked == 0 */
 } FfwsFrame;
 
-/* Send a complete text frame (FIN=1, server-side: unmasked). */
-int ffws_send_text(int fd, const void *data, size_t n);
-
-/* Send a complete binary frame. */
-int ffws_send_binary(int fd, const void *data, size_t n);
-
-/* Send a close frame; pass status == 0 to omit the body. */
-int ffws_send_close(int fd, uint16_t status);
-
-/* Send a pong frame echoing the given payload (RFC 6455 §5.5.3). */
-int ffws_send_pong(int fd, const void *data, size_t n);
+/* Note: the previous slice exposed blocking ffws_send_* helpers (text,
+ * binary, close, pong). They were removed when the WS module migrated
+ * to the event-driven Protocol ABI v3 (slice 1.7) because their
+ * blocking semantics don't fit the new model. Callers wanting to send
+ * WS frames should use the Protocol ABI via ffnet_server_run, or open
+ * an issue if a blocking-helper variant is needed. */
 
 #ifdef __cplusplus
 }

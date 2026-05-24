@@ -8,43 +8,35 @@
 extern "C" {
 #endif
 
-/* Protocol module ABI.
+/* Protocol module ABI v3 (event-driven, slice 1.7+).
  *
- * Designed against a single protocol (WebSocket). The fd-based, message-at-a-time
- * shape does not model multiplexed streams; expect this struct to evolve when
- * HTTP/2 or QUIC lands. Treat any field change as a major version bump.
+ * Each connection is a state machine owned by the protocol. The framework
+ * (libffnet/server.c) handles accept/close-fd and dispatches epoll events;
+ * the protocol owns everything that flows over fd. Slice 1.7 retired the
+ * earlier blocking-call ABI (server_handshake/read_frame/write_frame).
  *
- * Connection lifecycle for the caller:
- *     void *ctx;
- *     server_handshake(fd, &ctx);            // may allocate per-conn state
- *     while (...) {
- *         read_frame (fd, ctx, &in);          // ctx threads through
- *         write_frame(fd, ctx, &out);
- *     }
- *     close(fd, ctx);                          // frees state; caller closes fd
- *
- * Stateless protocols set *ctx_out = NULL in server_handshake and ignore ctx
- * everywhere else; close() must accept NULL ctx as a no-op. */
+ * Lifecycle:
+ *   open      called once after accept. fd is already non-blocking.
+ *   on_event  called whenever an event the protocol requested fires on fd.
+ *             Protocol reads/writes from/to fd (handling EAGAIN itself)
+ *             and returns the next event mask, 0 to close, or negative.
+ *   close     called when on_event returned 0 or negative, before the
+ *             framework closes fd. */
 typedef struct Protocol {
     const char *name;                                /* e.g. "websocket" */
 
-    /* Server-side handshake. Reads request bytes from `fd` and replies.
-     * On success, may allocate per-connection state and return it via
-     * `*ctx_out`; stateless protocols set `*ctx_out = NULL`. Returns FFE_OK
-     * on successful upgrade, negative on failure. */
-    int (*server_handshake)(int fd, void **ctx_out);
+    /* Allocate per-connection state. Returns FFE_OK and writes ctx into
+     * *ctx_out, or negative on failure (framework closes fd directly,
+     * neither on_event nor close are called). */
+    int (*open)(int fd, void **ctx_out);
 
-    /* Read one application-level frame from `fd`, appended to `out`.
-     * `ctx` is the value returned by server_handshake for this connection.
-     * Returns FFE_OK on success, FFE_CLOSED on orderly peer close, or
-     * negative on error. */
-    int (*read_frame)(int fd, void *ctx, FrameBuf *out);
+    /* Returns:
+     *   > 0  new event mask (FF_EV_READ | FF_EV_WRITE) to wait on next.
+     *   = 0  close this connection cleanly.
+     *   < 0  error; framework logs ffutil_strerror_v(rc) then closes. */
+    int (*on_event)(int fd, void *ctx, uint32_t events);
 
-    /* Write one application-level frame from `in` to `fd`. */
-    int (*write_frame)(int fd, void *ctx, const FrameBuf *in);
-
-    /* Release per-connection state. Does NOT close `fd`. Safe to call with
-     * NULL ctx. Returns FFE_OK or negative. */
+    /* Free per-connection state. Framework closes fd after returning. */
     int (*close)(int fd, void *ctx);
 } Protocol;
 

@@ -98,12 +98,56 @@ def recv_frame(sock: socket.socket):
 
 # --- Test driver ----------------------------------------------------------
 
+def one_client(host: str, port: int, label: str) -> str:
+    """Run a single client through handshake + text + binary echo.
+    Returns 'ok' or an error string."""
+    try:
+        sock = socket.create_connection((host, port), timeout=10)
+    except Exception as e:
+        return f"connect: {e}"
+
+    try:
+        key = base64.b64encode(os.urandom(16))
+        headers = handshake(sock, host, port, key)
+
+        status_line = headers.split("\r\n", 1)[0]
+        if "101" not in status_line:
+            return f"bad status line: {status_line!r}"
+
+        want = expected_accept(key)
+        m = re.search(r"Sec-WebSocket-Accept:\s*(\S+)", headers, re.IGNORECASE)
+        if not m or m.group(1) != want:
+            return f"bad accept: want {want}, got {m and m.group(1)}"
+
+        msg = f"hello ffnet from {label}".encode()
+        send_frame(sock, 0x1, msg)
+        fin, op, payload = recv_frame(sock)
+        if not (fin and op == 0x1 and payload == msg):
+            return f"text echo: fin={fin} op={op:#x} payload={payload!r}"
+
+        bmsg = b"\x00\x01\x02\xff\xaa\x55" + label.encode()
+        send_frame(sock, 0x2, bmsg)
+        fin, op, payload = recv_frame(sock)
+        if not (fin and op == 0x2 and payload == bmsg):
+            return f"binary echo: fin={fin} op={op:#x} payload={payload!r}"
+
+        return "ok"
+    except Exception as e:
+        return f"exception: {e}"
+    finally:
+        sock.close()
+
+
 def run(ffnet_path: str) -> int:
+    """Test in two phases: single-client baseline, then parallel multi-worker."""
+    import threading
+
+    rc = 0
+
+    # --- Phase 1: single client, --workers 1 ---
     proc = subprocess.Popen(
         [ffnet_path, "ws-echo", "--listen", "127.0.0.1:0"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
         line = proc.stdout.readline()
@@ -112,51 +156,60 @@ def run(ffnet_path: str) -> int:
             print(f"FAIL: expected listen line, got: {line!r}", file=sys.stderr)
             return 1
         port = int(m.group(1))
-        print(f"ok: bound on port {port}")
+        print(f"ok: bound on port {port} (single-worker)")
 
-        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
-        try:
-            key = base64.b64encode(os.urandom(16))
-            headers = handshake(sock, "127.0.0.1", port, key)
-
-            status_line = headers.split("\r\n", 1)[0]
-            if "101" not in status_line:
-                print(f"FAIL: bad status line: {status_line!r}", file=sys.stderr)
-                return 1
-
-            want = expected_accept(key)
-            m2 = re.search(r"Sec-WebSocket-Accept:\s*(\S+)", headers, re.IGNORECASE)
-            if not m2 or m2.group(1) != want:
-                print(f"FAIL: bad Sec-WebSocket-Accept; want {want}, got {m2 and m2.group(1)}",
-                      file=sys.stderr)
-                return 1
-            print("ok: handshake (accept key valid)")
-
-            send_frame(sock, 0x1, b"hello ffnet")
-            fin, op, payload = recv_frame(sock)
-            if not (fin and op == 0x1 and payload == b"hello ffnet"):
-                print(f"FAIL: text echo got fin={fin} op={op:#x} payload={payload!r}",
-                      file=sys.stderr)
-                return 1
-            print("ok: text echo")
-
-            send_frame(sock, 0x2, b"\x00\x01\x02\xff\xaa\x55")
-            fin, op, payload = recv_frame(sock)
-            if not (fin and op == 0x2 and payload == b"\x00\x01\x02\xff\xaa\x55"):
-                print(f"FAIL: binary echo got fin={fin} op={op:#x} payload={payload!r}",
-                      file=sys.stderr)
-                return 1
-            print("ok: binary echo")
-
-            return 0
-        finally:
-            sock.close()
+        result = one_client("127.0.0.1", port, "solo")
+        if result != "ok":
+            print(f"FAIL: single client: {result}", file=sys.stderr)
+            rc = 1
+        else:
+            print("ok: single-client handshake + text + binary echo")
     finally:
         proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        try: proc.wait(timeout=2)
+        except subprocess.TimeoutExpired: proc.kill()
+
+    if rc != 0:
+        return rc
+
+    # --- Phase 2: multi-worker, 3 parallel clients ---
+    proc = subprocess.Popen(
+        [ffnet_path, "ws-echo", "--listen", "127.0.0.1:0", "--workers", "2"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        line = proc.stdout.readline()
+        m = re.search(r"listening on 127\.0\.0\.1:(\d+)", line)
+        if not m:
+            print(f"FAIL: expected listen line (mw), got: {line!r}", file=sys.stderr)
+            return 1
+        port = int(m.group(1))
+        print(f"ok: bound on port {port} (workers=2)")
+
+        results = [None] * 3
+        threads = []
+        for i in range(3):
+            def runner(idx):
+                results[idx] = one_client("127.0.0.1", port, f"c{idx}")
+            t = threading.Thread(target=runner, args=(i,))
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        bad = [(i, r) for i, r in enumerate(results) if r != "ok"]
+        if bad:
+            for i, r in bad:
+                print(f"FAIL: parallel client {i}: {r}", file=sys.stderr)
+            rc = 1
+        else:
+            print("ok: 3 parallel clients across 2 workers")
+    finally:
+        proc.terminate()
+        try: proc.wait(timeout=2)
+        except subprocess.TimeoutExpired: proc.kill()
+
+    return rc
 
 
 def main() -> int:

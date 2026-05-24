@@ -2,7 +2,10 @@
 #include "ffnet/ffnet.h"
 #include "ffnet/ffutil.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 /* Asm-side primitives (Linux x86_64 raw syscalls). Each returns >=0 on
  * success or -errno on failure. */
@@ -80,4 +83,21 @@ int ffnet_tcp_close(int fd)
 {
     int rc = _ff_asm_close(fd);
     return rc < 0 ? ffutil_map_errno(rc) : FFE_OK;
+}
+
+int ffnet_set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return ffutil_map_errno(-errno);
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return ffutil_map_errno(-errno);
+    return FFE_OK;
+}
+
+int ffnet_tcp_set_reuseport(int fd)
+{
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) < 0)
+        return ffutil_map_errno(-errno);
+    return FFE_OK;
 }

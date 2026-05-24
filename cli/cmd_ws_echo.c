@@ -12,22 +12,23 @@ static void usage(FILE *out)
 {
     fprintf(out, "ffnet ws-echo — WebSocket echo server\n\n");
     fprintf(out, "usage:\n");
-    fprintf(out, "  ffnet ws-echo --listen <addr>:<port>\n\n");
+    fprintf(out, "  ffnet ws-echo --listen <addr>:<port> [--workers N]\n\n");
     fprintf(out,
-        "Each text/binary frame received from a client is echoed back to that\n"
-        "client with the same opcode. Control frames (ping, close) are handled\n"
-        "inline per RFC 6455. Single-threaded, blocking I/O, one client at a time\n"
-        "in slice 1.\n\n");
+        "Echoes each text/binary frame received from a client back to that\n"
+        "client with the same opcode. Control frames (ping, close) are\n"
+        "handled inline per RFC 6455. Multi-worker mode uses SO_REUSEPORT\n"
+        "to distribute incoming connections across N pthread workers.\n\n");
     fprintf(out, "arguments:\n");
     fprintf(out,
-        "  --listen <addr>:<port>   IPv4 dotted-quad and TCP port. Use port 0 to\n"
-        "                           request an ephemeral port; the actual bound\n"
-        "                           port is printed on stdout when ready.\n\n");
-    fprintf(out, "example:\n");
+        "  --listen <addr>:<port>   IPv4 dotted-quad and TCP port. Use port 0\n"
+        "                           to request an ephemeral port; the actual\n"
+        "                           bound port is printed on stdout when ready.\n"
+        "  --workers N              Number of pthread workers (default 1).\n\n");
+    fprintf(out, "examples:\n");
     fprintf(out, "  ffnet ws-echo --listen 127.0.0.1:8080\n");
+    fprintf(out, "  ffnet ws-echo --listen 0.0.0.0:8080 --workers 4\n");
 }
 
-/* Split "host:port" into a host string and a uint16_t port. */
 static int parse_listen(const char *spec, char *host_out, size_t host_cap,
                         uint16_t *port_out)
 {
@@ -46,47 +47,20 @@ static int parse_listen(const char *spec, char *host_out, size_t host_cap,
     return FFE_OK;
 }
 
-/* Run one connection through the full Protocol lifecycle. */
-static int serve_one(const Protocol *proto, int client_fd)
-{
-    void *ctx = NULL;
-    int rc = proto->server_handshake(client_fd, &ctx);
-    if (rc != FFE_OK) {
-        FF_LOGW("handshake: %s", ffutil_strerror_v(rc));
-        proto->close(client_fd, ctx);
-        return rc;
-    }
-
-    FrameBuf buf;
-    framebuf_init(&buf, 0);
-
-    for (;;) {
-        framebuf_reset(&buf);
-        rc = proto->read_frame(client_fd, ctx, &buf);
-        if (rc == FFE_CLOSED) { rc = FFE_OK; break; }
-        if (rc != FFE_OK) {
-            FF_LOGW("read_frame: %s", ffutil_strerror_v(rc));
-            break;
-        }
-        rc = proto->write_frame(client_fd, ctx, &buf);
-        if (rc != FFE_OK) {
-            FF_LOGW("write_frame: %s", ffutil_strerror_v(rc));
-            break;
-        }
-    }
-
-    framebuf_free(&buf);
-    proto->close(client_fd, ctx);
-    return rc;
-}
-
 int cmd_ws_echo(int argc, char **argv)
 {
     const char *listen_spec = NULL;
+    int workers = 1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
             listen_spec = argv[++i];
+        } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+            workers = atoi(argv[++i]);
+            if (workers < 1) {
+                fprintf(stderr, "ws-echo: --workers must be >= 1\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(stdout);
             return 0;
@@ -111,40 +85,10 @@ int cmd_ws_echo(int argc, char **argv)
         return 1;
     }
 
-    int listen_fd = ffnet_tcp_create();
-    if (listen_fd < 0) {
-        FF_LOGE("socket: %s", ffutil_strerror_v(listen_fd));
-        return 1;
-    }
-
-    int rc = ffnet_tcp_bind_listen(listen_fd, host, port, 16);
+    int rc = ffnet_server_run(ws, host, port, workers);
     if (rc != FFE_OK) {
-        FF_LOGE("bind_listen %s:%u: %s", host, (unsigned)port, ffutil_strerror_v(rc));
-        ffnet_tcp_close(listen_fd);
+        FF_LOGE("server_run: %s", ffutil_strerror_v(rc));
         return 1;
     }
-
-    int bound_port = ffnet_tcp_local_port(listen_fd);
-    if (bound_port < 0) {
-        FF_LOGE("local_port: %s", ffutil_strerror_v(bound_port));
-        ffnet_tcp_close(listen_fd);
-        return 1;
-    }
-
-    /* Stdout, unbuffered, so integration tests can read the bound port
-     * immediately after spawn (e.g. when --listen used port 0). */
-    printf("listening on %s:%d\n", host, bound_port);
-    fflush(stdout);
-
-    for (;;) {
-        int client_fd = ffnet_tcp_accept(listen_fd);
-        if (client_fd < 0) {
-            FF_LOGW("accept: %s", ffutil_strerror_v(client_fd));
-            continue;
-        }
-        FF_LOGI("client connected");
-        serve_one(ws, client_fd);
-        ffnet_tcp_close(client_fd);
-        FF_LOGI("client disconnected");
-    }
+    return 0;
 }

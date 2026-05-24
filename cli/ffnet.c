@@ -13,6 +13,7 @@
 #include <string.h>
 
 extern int cmd_ws_echo(int argc, char **argv);
+extern int cmd_tcp_echo(int argc, char **argv);
 
 typedef struct Subcommand {
     const char *name;
@@ -21,7 +22,8 @@ typedef struct Subcommand {
 } Subcommand;
 
 static const Subcommand g_cmds[] = {
-    { "ws-echo", cmd_ws_echo, "Run a WebSocket echo server" },
+    { "ws-echo",  cmd_ws_echo,  "Run a WebSocket echo server" },
+    { "tcp-echo", cmd_tcp_echo, "Run a raw TCP echo server (event loop demo)" },
 };
 static const size_t g_cmds_count = sizeof(g_cmds) / sizeof(g_cmds[0]);
 
