@@ -1,0 +1,41 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exp
+
+# Binaries
+/ffnet
+/ffnet.exe
+/tests/test_sha1
+/tests/test_base64
+/tests/test_tcp
+
+# Build output dirs
+/build/
+/out/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python (for integration tests)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs / reports
+*.log
+/autobahn-reports/

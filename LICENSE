@@ -1,0 +1,9 @@
+ffnet is licensed under the GNU Lesser General Public License,
+version 2.1 or (at your option) any later version.
+
+The full license text is in COPYING.LGPLv2.1, also available at
+<https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt>.
+
+Each source file carries an SPDX-License-Identifier header indicating
+the license that applies to it. All ffnet source files are currently
+licensed LGPL-2.1-or-later.
