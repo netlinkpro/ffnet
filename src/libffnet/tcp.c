@@ -12,10 +12,6 @@ int _ff_asm_accept(int fd);
 int _ff_asm_local_port(int fd);
 int _ff_asm_close(int fd);
 
-/* Slice 1 is intentionally coarse on error reporting: any -errno collapses
- * to FFE_IO. Preserving errno across the asm/C boundary is deferred. */
-static int map_io(int rc) { return rc < 0 ? FFE_IO : rc; }
-
 /* Parse a dotted-quad IPv4 string into a big-endian u32.
  * Strict: 1..3 decimal digits per part, exactly three dots, no trailing chars. */
 static int parse_ipv4(const char *s, uint32_t *out)
@@ -54,7 +50,7 @@ static int parse_ipv4(const char *s, uint32_t *out)
 int ffnet_tcp_create(void)
 {
     int rc = _ff_asm_socket_create();
-    return map_io(rc);
+    return rc < 0 ? ffutil_map_errno(rc) : rc;
 }
 
 int ffnet_tcp_bind_listen(int fd, const char *addr, uint16_t port, int backlog)
@@ -65,23 +61,23 @@ int ffnet_tcp_bind_listen(int fd, const char *addr, uint16_t port, int backlog)
 
     uint16_t port_be = (uint16_t)(((uint16_t)(port << 8)) | (port >> 8));
     rc = _ff_asm_bind_listen(fd, ip_be, port_be, backlog);
-    return map_io(rc);
+    return rc < 0 ? ffutil_map_errno(rc) : FFE_OK;
 }
 
 int ffnet_tcp_accept(int listen_fd)
 {
     int rc = _ff_asm_accept(listen_fd);
-    return map_io(rc);
+    return rc < 0 ? ffutil_map_errno(rc) : rc;
 }
 
 int ffnet_tcp_local_port(int fd)
 {
     int rc = _ff_asm_local_port(fd);
-    return map_io(rc);
+    return rc < 0 ? ffutil_map_errno(rc) : rc;
 }
 
 int ffnet_tcp_close(int fd)
 {
     int rc = _ff_asm_close(fd);
-    return rc < 0 ? FFE_IO : FFE_OK;
+    return rc < 0 ? ffutil_map_errno(rc) : FFE_OK;
 }
