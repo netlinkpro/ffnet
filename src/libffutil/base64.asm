@@ -172,3 +172,6 @@ ff_base64_encode:
     pop     r15
     pop     r12
     ret
+
+; Mark stack as non-executable (Linux/binutils convention).
+section .note.GNU-stack noalloc noexec nowrite progbits

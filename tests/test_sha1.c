@@ -35,7 +35,7 @@ int main(void)
     rc |= test_vec("empty", "", 0,
         "da39a3ee5e6b4b0d3255bfef95601890afd80709");
     rc |= test_vec("abc", "abc", 3,
-        "a9993e364706816aba3e25717850c26c9cd0d89c");
+        "a9993e364706816aba3e25717850c26c9cd0d89d");
     rc |= test_vec("rfc3174-tv2",
         "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56,
         "84983e441c3bd26ebaae4aa1f95129e5e54670f1");

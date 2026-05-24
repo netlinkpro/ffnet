@@ -165,3 +165,6 @@ _ff_asm_close:
     mov     eax, SYS_close
     syscall
     ret
+
+; Mark stack as non-executable (Linux/binutils convention).
+section .note.GNU-stack noalloc noexec nowrite progbits

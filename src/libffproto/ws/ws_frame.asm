@@ -33,3 +33,6 @@ _ff_asm_ws_unmask:
     jb      .loop
 .done:
     ret
+
+; Mark stack as non-executable (Linux/binutils convention).
+section .note.GNU-stack noalloc noexec nowrite progbits

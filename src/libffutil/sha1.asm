@@ -118,9 +118,15 @@ ff_sha1_finalize:
     ret
 
 ; ---------------------------------------------------------------------------
-; ff_sha1_compress: compress one 64-byte block at [rbx] into H at [rsp+0..19].
+; ff_sha1_compress: compress one 64-byte block at [rbx] into H at [rsp+8..27].
 ; Clobbers caller-saved regs (rax, rcx, rdx, rsi, rdi, r8-r11) and r15.
 ; Preserves rbx, r12, r13, r14 (the caller's loop state).
+;
+; NOTE: this function is invoked via `call` from ff_sha1's main flow. The call
+; pushes an 8-byte return address, so all offsets here are caller-frame + 8:
+;     [rsp +   0]  return address (DO NOT TOUCH)
+;     [rsp +   8 .. + 27]  H[0..4]
+;     [rsp +  40 .. + 359] W[0..79]
 ; ---------------------------------------------------------------------------
 ff_sha1_compress:
     ; Load 16 big-endian dwords into W[0..15].
@@ -128,7 +134,7 @@ ff_sha1_compress:
 .load:
     mov     eax, [rbx + rcx*4]
     bswap   eax
-    mov     [rsp + 32 + rcx*4], eax
+    mov     [rsp + 40 + rcx*4], eax
     inc     ecx
     cmp     ecx, 16
     jb      .load
@@ -136,22 +142,22 @@ ff_sha1_compress:
     ; Expand W[16..79] = ROL(W[t-3] ^ W[t-8] ^ W[t-14] ^ W[t-16], 1).
     mov     ecx, 16
 .expand:
-    mov     eax, [rsp + 32 + rcx*4 - 12]    ; W[t-3]
-    xor     eax, [rsp + 32 + rcx*4 - 32]    ; W[t-8]
-    xor     eax, [rsp + 32 + rcx*4 - 56]    ; W[t-14]
-    xor     eax, [rsp + 32 + rcx*4 - 64]    ; W[t-16]
+    mov     eax, [rsp + 40 + rcx*4 - 12]    ; W[t-3]
+    xor     eax, [rsp + 40 + rcx*4 - 32]    ; W[t-8]
+    xor     eax, [rsp + 40 + rcx*4 - 56]    ; W[t-14]
+    xor     eax, [rsp + 40 + rcx*4 - 64]    ; W[t-16]
     rol     eax, 1
-    mov     [rsp + 32 + rcx*4], eax
+    mov     [rsp + 40 + rcx*4], eax
     inc     ecx
     cmp     ecx, 80
     jb      .expand
 
     ; Working vars: a=r8d, b=r9d, c=r10d, d=r11d, e=esi.
-    mov     r8d,  [rsp +  0]
-    mov     r9d,  [rsp +  4]
-    mov     r10d, [rsp +  8]
-    mov     r11d, [rsp + 12]
-    mov     esi,  [rsp + 16]
+    mov     r8d,  [rsp +  8]
+    mov     r9d,  [rsp + 12]
+    mov     r10d, [rsp + 16]
+    mov     r11d, [rsp + 20]
+    mov     esi,  [rsp + 24]
 
     xor     ecx, ecx
 .round:
@@ -195,7 +201,7 @@ ff_sha1_compress:
     ; eax holds F(b,c,d); edi holds K_t.
     add     eax, esi                  ; + e
     add     eax, edi                  ; + K_t
-    add     eax, [rsp + 32 + rcx*4]   ; + W[t]
+    add     eax, [rsp + 40 + rcx*4]   ; + W[t]
     mov     edi, r8d
     rol     edi, 5
     add     eax, edi                  ; + ROL5(a)  → eax = new a
@@ -211,9 +217,12 @@ ff_sha1_compress:
     cmp     ecx, 80
     jb      .round
 
-    add     [rsp +  0], r8d
-    add     [rsp +  4], r9d
-    add     [rsp +  8], r10d
-    add     [rsp + 12], r11d
-    add     [rsp + 16], esi
+    add     [rsp +  8], r8d
+    add     [rsp + 12], r9d
+    add     [rsp + 16], r10d
+    add     [rsp + 20], r11d
+    add     [rsp + 24], esi
     ret
+
+; Mark stack as non-executable (Linux/binutils convention).
+section .note.GNU-stack noalloc noexec nowrite progbits

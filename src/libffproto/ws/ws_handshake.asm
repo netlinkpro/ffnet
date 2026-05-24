@@ -253,3 +253,6 @@ _ff_asm_ws_send_response:
     pop     r12
     pop     rbx
     ret
+
+; Mark stack as non-executable (Linux/binutils convention).
+section .note.GNU-stack noalloc noexec nowrite progbits

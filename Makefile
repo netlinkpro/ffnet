@@ -8,14 +8,15 @@
 #
 # Tooling: NASM (-f elf64) for .asm, $(CC) for .c, ar for .a archives.
 
-CC      ?= cc
-AS      ?= nasm
-AR      ?= ar
-PYTHON  ?= python3
+CC       ?= cc
+NASM     ?= nasm
+AR       ?= ar
+PYTHON   ?= python3
 
-CFLAGS  ?= -O2 -g -Wall -Wextra -Wpedantic -std=c11 -fPIE -D_DEFAULT_SOURCE
-LDFLAGS ?= -pie
-ASFLAGS ?= -f elf64 -F dwarf -g -w+all
+CFLAGS   ?= -O2 -g -Wall -Wextra -Wpedantic -std=c11 -fPIE -D_DEFAULT_SOURCE
+LDFLAGS  ?= -pie
+# NB: do NOT use AS / ASFLAGS — make has builtin defaults (AS=as) that override `?=`.
+NASMFLAGS ?= -f elf64 -F dwarf -g -w+all
 
 INCLUDES = -I include
 BUILD    = build
@@ -110,15 +111,15 @@ $(BUILD)/cli/%.o: cli/%.c
 # ===========================================================================
 $(BUILD)/libffutil/%.o: src/libffutil/%.asm
 	@mkdir -p $(@D)
-	$(AS) $(ASFLAGS) -o $@ $<
+	$(NASM) $(NASMFLAGS) -o $@ $<
 
 $(BUILD)/libffnet/tcp_asm.o: src/libffnet/tcp.asm
 	@mkdir -p $(@D)
-	$(AS) $(ASFLAGS) -o $@ $<
+	$(NASM) $(NASMFLAGS) -o $@ $<
 
 $(BUILD)/libffproto/ws/%.o: src/libffproto/ws/%.asm
 	@mkdir -p $(@D)
-	$(AS) $(ASFLAGS) -o $@ $<
+	$(NASM) $(NASMFLAGS) -o $@ $<
 
 # ===========================================================================
 # Tests
