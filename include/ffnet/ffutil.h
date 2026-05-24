@@ -20,7 +20,31 @@ extern "C" {
 #define FFE_CLOSED    -5   /* peer closed the connection cleanly                */
 #define FFE_INVAL     -6   /* invalid argument                                   */
 
+/* I/O-class codes (range 7..13). The `ffutil_strerror_v` helper uses this
+ * range to decide whether the current errno is worth printing alongside. */
+#define FFE_AGAIN    -7    /* EAGAIN / EWOULDBLOCK — try again                  */
+#define FFE_REFUSED  -8    /* ECONNREFUSED                                       */
+#define FFE_RESET    -9    /* ECONNRESET — peer reset the connection            */
+#define FFE_PIPE    -10    /* EPIPE — broken pipe on write                       */
+#define FFE_TIMEOUT -11    /* ETIMEDOUT                                          */
+#define FFE_PERM    -12    /* EACCES / EPERM                                     */
+#define FFE_INTR    -13    /* EINTR — signal interrupted the syscall             */
+
 const char *ffutil_strerror(int code);
+
+/* Translate a negative errno (-EAGAIN, -ECONNREFUSED, etc.) into the matching
+ * FFE_* code. Returns FFE_IO for unrecognized values. Sets `errno =
+ * -negative_errno` as a side effect so callers can follow up with
+ * `strerror(errno)` for a human description. */
+int ffutil_map_errno(int negative_errno);
+
+/* Format an FFE_* code for a log line. For I/O-class codes (FFE_IO plus the
+ * range FFE_AGAIN..FFE_INTR), appends " (<strerror>)" using the current
+ * errno. For non-I/O codes (FFE_OK, FFE_PROTOCOL, FFE_BADKEY, FFE_NOMEM,
+ * FFE_CLOSED, FFE_INVAL), returns just the FFE_* name to avoid printing
+ * stale errno noise. Returns a pointer to a thread-unsafe static buffer;
+ * revisit when slice 1.7 introduces threading. */
+const char *ffutil_strerror_v(int rc);
 
 /* ===== Logging =====
  * Output goes to stderr. Active level is read once from FFNET_LOG_LEVEL

@@ -54,9 +54,10 @@ LIBS = $(LIBFFPROTO) $(LIBFFNET) $(LIBFFUTIL)
 
 # ---- Tests ----------------------------------------------------------------
 TEST_BINS = \
-    $(BUILD)/tests/test_sha1   \
-    $(BUILD)/tests/test_base64 \
-    $(BUILD)/tests/test_tcp
+    $(BUILD)/tests/test_sha1    \
+    $(BUILD)/tests/test_base64  \
+    $(BUILD)/tests/test_tcp     \
+    $(BUILD)/tests/test_ffutil
 
 # ===========================================================================
 # Default target

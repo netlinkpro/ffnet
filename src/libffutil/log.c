@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #include "ffnet/ffutil.h"
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +40,26 @@ void ff_log_emit(int level, const char *file, int line, const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+int ffutil_map_errno(int negative_errno)
+{
+    int e = -negative_errno;
+    errno = e;
+    switch (e) {
+    case EAGAIN:        return FFE_AGAIN;
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:   return FFE_AGAIN;
+#endif
+    case ECONNREFUSED:  return FFE_REFUSED;
+    case ECONNRESET:    return FFE_RESET;
+    case EPIPE:         return FFE_PIPE;
+    case ETIMEDOUT:     return FFE_TIMEOUT;
+    case EACCES:
+    case EPERM:         return FFE_PERM;
+    case EINTR:         return FFE_INTR;
+    default:            return FFE_IO;
+    }
+}
+
 const char *ffutil_strerror(int code)
 {
     switch (code) {
@@ -49,6 +70,27 @@ const char *ffutil_strerror(int code)
     case FFE_NOMEM:    return "FFE_NOMEM";
     case FFE_CLOSED:   return "FFE_CLOSED";
     case FFE_INVAL:    return "FFE_INVAL";
+    case FFE_AGAIN:    return "FFE_AGAIN";
+    case FFE_REFUSED:  return "FFE_REFUSED";
+    case FFE_RESET:    return "FFE_RESET";
+    case FFE_PIPE:     return "FFE_PIPE";
+    case FFE_TIMEOUT:  return "FFE_TIMEOUT";
+    case FFE_PERM:     return "FFE_PERM";
+    case FFE_INTR:     return "FFE_INTR";
     default:           return "FFE_UNKNOWN";
     }
+}
+
+const char *ffutil_strerror_v(int rc)
+{
+    static char buf[128];
+
+    /* I/O-class range: FFE_IO (-1) and FFE_AGAIN..FFE_INTR (-7..-13). */
+    int is_io = (rc == FFE_IO) || (rc <= FFE_AGAIN && rc >= FFE_INTR);
+
+    const char *name = ffutil_strerror(rc);
+    if (!is_io) return name;
+
+    snprintf(buf, sizeof buf, "%s (%s)", name, strerror(errno));
+    return buf;
 }
