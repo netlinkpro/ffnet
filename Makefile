@@ -141,6 +141,10 @@ $(BUILD)/tests/test_%: tests/test_%.c $(LIBS)
 itest: $(BUILD)/ffnet
 	$(PYTHON) tests/test_ws_echo.py $(BUILD)/ffnet
 
+.PHONY: autobahn
+autobahn: $(BUILD)/ffnet
+	tests/autobahn/run.sh
+
 # ===========================================================================
 # Misc
 # ===========================================================================

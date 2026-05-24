@@ -39,3 +39,5 @@ venv/
 # Logs / reports
 *.log
 /autobahn-reports/
+/tests/autobahn/reports/
+/tests/autobahn/server.log
