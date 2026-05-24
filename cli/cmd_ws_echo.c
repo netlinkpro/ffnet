@@ -52,7 +52,7 @@ static int serve_one(const Protocol *proto, int client_fd)
     void *ctx = NULL;
     int rc = proto->server_handshake(client_fd, &ctx);
     if (rc != FFE_OK) {
-        FF_LOGW("handshake: %s", ffutil_strerror(rc));
+        FF_LOGW("handshake: %s", ffutil_strerror_v(rc));
         proto->close(client_fd, ctx);
         return rc;
     }
@@ -65,12 +65,12 @@ static int serve_one(const Protocol *proto, int client_fd)
         rc = proto->read_frame(client_fd, ctx, &buf);
         if (rc == FFE_CLOSED) { rc = FFE_OK; break; }
         if (rc != FFE_OK) {
-            FF_LOGW("read_frame: %s", ffutil_strerror(rc));
+            FF_LOGW("read_frame: %s", ffutil_strerror_v(rc));
             break;
         }
         rc = proto->write_frame(client_fd, ctx, &buf);
         if (rc != FFE_OK) {
-            FF_LOGW("write_frame: %s", ffutil_strerror(rc));
+            FF_LOGW("write_frame: %s", ffutil_strerror_v(rc));
             break;
         }
     }
@@ -113,20 +113,20 @@ int cmd_ws_echo(int argc, char **argv)
 
     int listen_fd = ffnet_tcp_create();
     if (listen_fd < 0) {
-        FF_LOGE("socket: %s", ffutil_strerror(listen_fd));
+        FF_LOGE("socket: %s", ffutil_strerror_v(listen_fd));
         return 1;
     }
 
     int rc = ffnet_tcp_bind_listen(listen_fd, host, port, 16);
     if (rc != FFE_OK) {
-        FF_LOGE("bind_listen %s:%u: %s", host, (unsigned)port, ffutil_strerror(rc));
+        FF_LOGE("bind_listen %s:%u: %s", host, (unsigned)port, ffutil_strerror_v(rc));
         ffnet_tcp_close(listen_fd);
         return 1;
     }
 
     int bound_port = ffnet_tcp_local_port(listen_fd);
     if (bound_port < 0) {
-        FF_LOGE("local_port: %s", ffutil_strerror(bound_port));
+        FF_LOGE("local_port: %s", ffutil_strerror_v(bound_port));
         ffnet_tcp_close(listen_fd);
         return 1;
     }
@@ -139,7 +139,7 @@ int cmd_ws_echo(int argc, char **argv)
     for (;;) {
         int client_fd = ffnet_tcp_accept(listen_fd);
         if (client_fd < 0) {
-            FF_LOGW("accept: %s", ffutil_strerror(client_fd));
+            FF_LOGW("accept: %s", ffutil_strerror_v(client_fd));
             continue;
         }
         FF_LOGI("client connected");
