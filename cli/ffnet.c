@@ -8,6 +8,7 @@
 //   4. Add the .o to CLI_OBJ in the Makefile.
 // Top-level `ffnet --help` auto-includes any new entry from g_cmds[].
 
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -39,6 +40,10 @@ static void print_help(FILE *out)
 
 int main(int argc, char **argv)
 {
+    /* Network servers must not die when a peer half-closes; let write()
+     * return EPIPE/-1 instead so we can translate to FFE_PIPE. */
+    signal(SIGPIPE, SIG_IGN);
+
     if (argc < 2) {
         print_help(stderr);
         return 1;
