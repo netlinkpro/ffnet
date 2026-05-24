@@ -4,6 +4,7 @@
 #include "ffnet/ffutil.h"
 #include "ffnet/byteorder.h"
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -38,7 +39,10 @@ static int read_n(int fd, void *buf, size_t n)
     while (got < n) {
         ssize_t r = read(fd, p + got, n - got);
         if (r == 0) return FFE_CLOSED;
-        if (r <  0) return FFE_IO;
+        if (r <  0) {
+            if (errno == EINTR) continue;       /* retry on signal */
+            return ffutil_map_errno(-errno);
+        }
         got += (size_t)r;
     }
     return FFE_OK;
@@ -50,7 +54,11 @@ static int write_n(int fd, const void *buf, size_t n)
     size_t sent = 0;
     while (sent < n) {
         ssize_t w = write(fd, p + sent, n - sent);
-        if (w <= 0) return FFE_IO;
+        if (w <  0) {
+            if (errno == EINTR) continue;
+            return ffutil_map_errno(-errno);
+        }
+        if (w == 0) return FFE_IO;              /* shouldn't happen for blocking sockets */
         sent += (size_t)w;
     }
     return FFE_OK;
